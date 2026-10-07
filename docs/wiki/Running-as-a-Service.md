@@ -32,7 +32,8 @@ the unit runs as, out of a declaration installed beside the unit, and a tarball 
 | Path | What |
 |---|---|
 | `/usr/local/bin/sendspin-cli` | the binary |
-| `/usr/local/lib/systemd/system/sendspin-cli.service` | the unit |
+| `/usr/local/lib/systemd/system/sendspin-cli.service` | the system unit |
+| `/usr/local/lib/systemd/user/sendspin-cli.service` | the user unit, for PipeWire in a login session |
 | `/usr/local/lib/sysusers.d/sendspin-cli.conf` | the account the unit runs as, declared |
 | `/usr/local/share/doc/sendspin-cli/README.md` | quick-start and wiki links |
 | `/usr/local/share/doc/sendspin-cli/contributors.md` | how to build and contribute |
@@ -232,13 +233,16 @@ and a second one would be noise. Only a `-f` logfile gets our own timestamp. See
 
 If the player should follow your desktop session's sound server, a user unit is the better
 fit — `$XDG_RUNTIME_DIR` and `$XDG_STATE_HOME` both exist there, so neither flag is needed
-and `output = default` works as it does from your shell:
+and `output = default` works as it does from your shell. `output = pipewire` reaches that
+session's graph, which the `sendspin-cli` system account cannot see.
+
+`scripts/get_started_linux.sh --user <name>` copies the user unit below into that account's
+`~/.config/systemd/user/`, enables it, and leaves the system unit disabled. Pass `--user`
+again on a later run: without it the script enables the system unit. By hand:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp /usr/local/lib/systemd/system/sendspin-cli.service ~/.config/systemd/user/
-# edit out the --control-socket and --state-dir arguments, the two Directory= lines,
-# and the User= line -- a user unit cannot set one, and would refuse to start with it
+cp /usr/local/lib/systemd/user/sendspin-cli.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now sendspin-cli
 loginctl enable-linger "$USER"     # so it runs when you are not logged in
@@ -248,8 +252,9 @@ Your own account needs `audio` membership for `/dev/snd` here, since the `sendsp
 account's membership does nothing for a unit that is not running as it:
 `sudo usermod -aG audio "$USER"`, then log out and back in.
 
-The unit that ships is the system one; this is a recipe rather than something the project
-installs or tests.
+Two units ship in the payload. The system one runs as the `sendspin-cli` account; the user
+one has no `User=` line and no path flags on `ExecStart`, and keeps `ProtectHome=no` and
+`ProtectSystem=no` so `/run/user` stays open for PipeWire.
 
 ## Uninstalling
 
@@ -257,6 +262,7 @@ installs or tests.
 sudo systemctl disable --now sendspin-cli
 sudo rm -f /usr/local/bin/sendspin-cli
 sudo rm -f /usr/local/lib/systemd/system/sendspin-cli.service
+sudo rm -f /usr/local/lib/systemd/user/sendspin-cli.service
 sudo rm -f /usr/local/lib/sysusers.d/sendspin-cli.conf
 sudo rm -rf /usr/local/share/doc/sendspin-cli
 sudo rm -rf /var/lib/sendspin-cli          # what it remembered

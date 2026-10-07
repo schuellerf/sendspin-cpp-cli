@@ -1,0 +1,65 @@
+# sendspin-cli as a user service, for PipeWire or PulseAudio in the login session.
+#
+#   cp /usr/local/lib/systemd/user/sendspin-cli.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sendspin-cli
+#   loginctl enable-linger "$USER"
+#
+# Or: scripts/get_started_linux.sh --user <name>
+#
+# Configure in ~/.config/sendspin-cli/config or /etc/sendspin-cli.conf. Needs systemd 236;
+# the hardening block wants 247.
+
+[Unit]
+Description=Sendspin audio player
+Documentation=https://github.com/Sendspin/sendspin-cpp-cli
+# The player retries mDNS and dials on a backoff, so network-online.target buys nothing.
+After=network.target sound.target
+# Ordering only: an unavailable avahi-daemon is retried, not fatal.
+After=avahi-daemon.service
+# PipeWire's socket is in $XDG_RUNTIME_DIR; start after the session graph is up.
+After=pipewire.service pipewire.socket
+
+[Service]
+# Foreground; journald captures stderr.
+Type=simple
+
+# A user manager sets $XDG_RUNTIME_DIR and $XDG_STATE_HOME, so ExecStart needs no path flags.
+# ProtectHome=yes and ProtectSystem=strict hide or freeze /run/user, which breaks PipeWire
+# and the default control socket.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+ProtectSystem=no
+ProtectHome=no
+PrivateTmp=yes
+
+# ProtectProc= hides other users' processes but not /proc/asound.
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# AF_NETLINK for getifaddrs(), which the default MAC-derived client id needs.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# @system-service covers libasound's syscalls.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# Not set: PrivateDevices=, DeviceAllow=, ProcSubset=pid, RestrictRealtime= (untested with a real card).
+
+ExecStart=@SENDSPIN_CLI_INSTALLED_BINARY@
+
+# Clean exit is a stop; failures (device not ready, bad config) retry every 5s indefinitely.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -37,6 +37,15 @@ Run them? [y/N]
 cannot ask refuses rather than assuming. `--version v0.1.0` installs a specific release
 instead of the newest.
 
+`--user <name>` installs the same binary but runs it as that existing account's user
+unit, and leaves the system unit disabled. The `sendspin-cli` system account has no
+login session, so it cannot open PipeWire. The script copies
+`/usr/local/lib/systemd/user/sendspin-cli.service` into that account's home — see
+[Running as a Service](Running-as-a-Service#a-user-unit-instead). Pass `--user` again when
+you upgrade: a run without it enables the system unit. For PipeWire, set
+`output = pipewire` (or `pipewire:<node>` from the device list the script prints as that
+account).
+
 ### What it actually does
 
 1. **Checks the architecture** — the userland's, read from `dpkg --print-architecture`

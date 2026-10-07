@@ -27,6 +27,7 @@ sendspin-cli-0.1.0-linux-arm64/
 └── usr/local/
     ├── bin/sendspin-cli
     ├── lib/systemd/system/sendspin-cli.service             # Linux only
+    ├── lib/systemd/user/sendspin-cli.service               # Linux only
     ├── lib/sysusers.d/sendspin-cli.conf                    # Linux only
     └── share/doc/sendspin-cli/
         ├── README.md
