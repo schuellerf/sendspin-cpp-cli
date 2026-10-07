@@ -19,10 +19,14 @@
 # Every root command is printed first and confirmed, or pre-authorised with --yes.
 #
 # Usage: scripts/get_started_linux.sh [--version <tag>] [--yes]
+#        scripts/get_started_linux.sh --user <name> [--version <tag>] [--yes]
 #
 #   --version <tag>  install this release instead of the latest, e.g. --version v0.1.0
 #   --yes            do not prompt before the commands that need root. Required when stdin
 #                    is not a terminal, since there is nobody there to ask
+#   --user <name>    run the player as this existing account's user unit. The system unit is
+#                    installed and left disabled. Pass --user again on a later run: without it
+#                    the system unit is enabled
 #
 # Environment:
 #
@@ -40,6 +44,7 @@ readonly REPO='Sendspin/sendspin-cpp-cli'
 
 readonly UNIT='sendspin-cli'
 readonly UNIT_FILE='/usr/local/lib/systemd/system/sendspin-cli.service'
+readonly USER_UNIT_FILE='/usr/local/lib/systemd/user/sendspin-cli.service'
 readonly SYSUSERS_FILE='/usr/local/lib/sysusers.d/sendspin-cli.conf'
 readonly SERVICE_USER='sendspin-cli'
 readonly BINARY='/usr/local/bin/sendspin-cli'
@@ -64,12 +69,18 @@ step() {
 
 VERSION_TAG=''
 ASSUME_YES='no'
+SERVICE_LOGIN=''
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --version)
             [ "$#" -ge 2 ] || fail '--version needs a tag, e.g. --version v0.1.0'
             VERSION_TAG=$2
+            shift 2
+            ;;
+        --user)
+            [ "$#" -ge 2 ] || fail '--user needs an account name, e.g. --user pi'
+            SERVICE_LOGIN=$2
             shift 2
             ;;
         --yes | -y)
@@ -87,7 +98,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-readonly VERSION_TAG ASSUME_YES
+readonly VERSION_TAG ASSUME_YES SERVICE_LOGIN
 
 # Is this a host this can work on at all
 
@@ -194,6 +205,60 @@ as_root() {
     fi
 }
 
+# `runuser` when already root, `sudo -u` otherwise. Printed the same way.
+as_login() {
+    if [ "$(id -u)" -eq 0 ]; then
+        runuser -u "$SERVICE_LOGIN" -- "$@"
+    else
+        sudo -u "$SERVICE_LOGIN" -- "$@"
+    fi
+}
+
+as_login_session() {
+    as_login env \
+        XDG_RUNTIME_DIR="/run/user/$LOGIN_UID" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$LOGIN_UID/bus" \
+        "$@"
+}
+
+LOGIN_UID=''
+LOGIN_GID=''
+LOGIN_HOME=''
+LOGIN_P=''
+SESSION_P=''
+USER_UNIT_DEST=''
+USER_CONFIG=''
+if [ -n "$SERVICE_LOGIN" ]; then
+    [ "$HAVE_SYSTEMD" = 'yes' ] ||
+        fail '--user needs a running systemd: a user unit has nowhere to go without one'
+
+    command -v getent >/dev/null 2>&1 ||
+        fail "getent is not on \$PATH, so this cannot look up the '$SERVICE_LOGIN' account"
+
+    if [ "$(id -u)" -eq 0 ]; then
+        command -v runuser >/dev/null 2>&1 ||
+            fail "runuser is not on \$PATH, so this cannot run commands as '$SERVICE_LOGIN'
+    (it is in util-linux)"
+        LOGIN_P="runuser -u ${SERVICE_LOGIN} -- "
+    else
+        LOGIN_P="sudo -u ${SERVICE_LOGIN} -- "
+    fi
+
+    login_ent="$(getent passwd "$SERVICE_LOGIN")" ||
+        fail "there is no account named '$SERVICE_LOGIN' to run the player as"
+    LOGIN_UID="$(printf '%s\n' "$login_ent" | cut -d: -f3)"
+    LOGIN_GID="$(printf '%s\n' "$login_ent" | cut -d: -f4)"
+    LOGIN_HOME="$(printf '%s\n' "$login_ent" | cut -d: -f6)"
+    if [ -z "$LOGIN_UID" ] || [ -z "$LOGIN_GID" ] || [ ! -d "$LOGIN_HOME" ]; then
+        fail "account '$SERVICE_LOGIN' has home '$LOGIN_HOME', which is not a directory, so
+    there is nowhere to put a user unit"
+    fi
+    USER_UNIT_DEST="$LOGIN_HOME/.config/systemd/user/sendspin-cli.service"
+    USER_CONFIG="$LOGIN_HOME/.config/sendspin-cli/config"
+    SESSION_P="${LOGIN_P}env XDG_RUNTIME_DIR=/run/user/${LOGIN_UID} DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${LOGIN_UID}/bus "
+fi
+readonly LOGIN_UID LOGIN_GID LOGIN_HOME LOGIN_P SESSION_P USER_UNIT_DEST USER_CONFIG
+
 WORK_DIR="$(mktemp -d)"
 readonly WORK_DIR
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -205,6 +270,9 @@ if [ "$HAVE_SYSTEMD" = 'yes' ]; then
     say '  systemd:      yes'
 else
     say '  systemd:      no -- the unit will be installed but nothing started'
+fi
+if [ -n "$SERVICE_LOGIN" ]; then
+    say "  account:      $SERVICE_LOGIN (user unit; the system unit is left disabled)"
 fi
 
 # The payload
@@ -329,18 +397,24 @@ if grep -Fqx "$PAYLOAD_ROOT/usr/local/lib/sysusers.d/sendspin-cli.conf" <<<"$ARC
 fi
 readonly PAYLOAD_HAS_SYSUSERS
 
-# Only where systemd can use the account.
+# Only where systemd can use the account. --user runs as an account that already exists.
 CREATE_USER='no'
-if [ "$HAVE_SYSTEMD" = 'yes' ] && [ "$PAYLOAD_HAS_SYSUSERS" = 'yes' ]; then
+if [ -z "$SERVICE_LOGIN" ] && [ "$HAVE_SYSTEMD" = 'yes' ] && [ "$PAYLOAD_HAS_SYSUSERS" = 'yes' ]; then
     CREATE_USER='yes'
 fi
 readonly CREATE_USER
 
-# An `output` in /etc/sendspin-cli.conf decides whether the player starts at the end.
+# An `output` decides whether the player starts at the end.
+# The user unit reads ~/.config/sendspin-cli/config first, then /etc/sendspin-cli.conf.
 # Read as root: the file may be unreadable, and grep's exit 2 would look like "no output".
+OUTPUT_CONFIG=$CONFIG
+if [ -n "$SERVICE_LOGIN" ] && as_root test -f "$USER_CONFIG"; then
+    OUTPUT_CONFIG=$USER_CONFIG
+fi
+readonly OUTPUT_CONFIG
 CONFIG_HAS_OUTPUT='no'
-if as_root test -f "$CONFIG" &&
-    as_root grep -Eq '^[[:space:]]*output[[:space:]]*=' "$CONFIG"; then
+if as_root test -f "$OUTPUT_CONFIG" &&
+    as_root grep -Eq '^[[:space:]]*output[[:space:]]*=' "$OUTPUT_CONFIG"; then
     CONFIG_HAS_OUTPUT='yes'
 fi
 readonly CONFIG_HAS_OUTPUT
@@ -360,7 +434,20 @@ fi
 if [ "$CREATE_USER" = 'yes' ]; then
     say "  ${SUDO_P}systemd-sysusers"
 fi
-if [ "$HAVE_SYSTEMD" = 'yes' ]; then
+if [ -n "$SERVICE_LOGIN" ]; then
+    say "  ${SUDO_P}systemctl daemon-reload"
+    say "  ${SUDO_P}systemctl disable --now $UNIT"
+    say "  ${LOGIN_P}mkdir -p $(dirname "$USER_UNIT_DEST")"
+    say "  ${SUDO_P}install -o $LOGIN_UID -g $LOGIN_GID -m 0644 $USER_UNIT_FILE $USER_UNIT_DEST"
+    say "  ${SUDO_P}loginctl enable-linger $SERVICE_LOGIN"
+    say "  ${SESSION_P}systemctl --user daemon-reload"
+    say "  ${SESSION_P}systemctl --user enable $UNIT"
+    if [ "$CONFIG_HAS_OUTPUT" = 'yes' ]; then
+        say "  ${SESSION_P}systemctl --user restart $UNIT"
+    else
+        say "  ${SESSION_P}$BINARY -l"
+    fi
+elif [ "$HAVE_SYSTEMD" = 'yes' ]; then
     say "  ${SUDO_P}systemctl daemon-reload"
     say "  ${SUDO_P}systemctl enable $UNIT"
     if [ "$CONFIG_HAS_OUTPUT" = 'yes' ]; then
@@ -371,6 +458,10 @@ if [ "$HAVE_SYSTEMD" = 'yes' ]; then
 fi
 say ''
 say "Naming '$PAYLOAD_ROOT/usr' is what keeps the archive's BUILD-INFO.txt out of /."
+if [ -n "$SERVICE_LOGIN" ]; then
+    say "The player runs as '$SERVICE_LOGIN' via a user unit. The system unit is installed and disabled."
+    say "Pass --user again on a later run. Without it, that system unit is enabled."
+fi
 if [ "$CREATE_USER" = 'yes' ]; then
     say "'systemd-sysusers' creates the unprivileged '$SERVICE_USER' account the unit runs as,"
     say "reading the declaration the line above it installs at $SYSUSERS_FILE."
@@ -380,7 +471,10 @@ if [ "$SEED_CONFIG" = 'yes' ]; then
     say "There is no $CONFIG yet, so the installed example is copied there for you to edit."
     say 'Every line in it is commented out, so it chooses nothing on its own.'
 fi
-if [ "$HAVE_SYSTEMD" = 'yes' ] && [ "$CONFIG_HAS_OUTPUT" != 'yes' ]; then
+if [ -n "$SERVICE_LOGIN" ] && [ "$CONFIG_HAS_OUTPUT" != 'yes' ]; then
+    say "No 'output' is set in $OUTPUT_CONFIG, so the user unit is enabled but NOT started."
+    say "The device list is printed as '$SERVICE_LOGIN'. Name an output in the config, then start it."
+elif [ "$HAVE_SYSTEMD" = 'yes' ] && [ "$CONFIG_HAS_OUTPUT" != 'yes' ]; then
     say "No 'output' is set in $CONFIG, so the unit is enabled but NOT started: under"
     say "systemd there is no PipeWire for ALSA's 'default' to follow, and starting it now"
     say 'would usually mean a player failing and being retried every five seconds. The'
@@ -418,6 +512,96 @@ say "  $BINARY"
 if [ "$SEED_CONFIG" = 'yes' ]; then
     as_root cp "$CONFIG_EXAMPLE" "$CONFIG"
     say "  $CONFIG  (from the installed example; everything in it is commented out)"
+fi
+
+if [ -n "$SERVICE_LOGIN" ]; then
+    step "Setting the service up for $SERVICE_LOGIN"
+
+    as_root systemctl daemon-reload
+    as_root systemctl disable --now "$UNIT"
+    say "  system unit disabled (it stays installed; a run without --user enables it again)"
+
+    [ -f "$USER_UNIT_FILE" ] ||
+        fail "the payload installed no user unit at $USER_UNIT_FILE -- take a release that ships
+    lib/systemd/user/sendspin-cli.service, or rebuild and pass SENDSPIN_CLI_TARBALL"
+
+    as_login mkdir -p "$(dirname "$USER_UNIT_DEST")"
+    as_root install -o "$LOGIN_UID" -g "$LOGIN_GID" -m 0644 \
+        "$USER_UNIT_FILE" "$USER_UNIT_DEST"
+    say "  unit:   $USER_UNIT_DEST"
+
+    as_root loginctl enable-linger "$SERVICE_LOGIN"
+    if ! as_root test -S "/run/user/$LOGIN_UID/bus"; then
+        sleep 2
+    fi
+    as_login_session systemctl --user daemon-reload ||
+        fail "the user manager for '$SERVICE_LOGIN' is not running, so the unit cannot be enabled.
+    'loginctl enable-linger $SERVICE_LOGIN' was run. A user unit needs /run/user/$LOGIN_UID/bus."
+    as_login_session systemctl --user enable "$UNIT"
+    say "  enabled: $UNIT starts as $SERVICE_LOGIN"
+
+    if [ "$CONFIG_HAS_OUTPUT" = 'yes' ]; then
+        # restart, not start, so an upgrade replaces the running binary.
+        as_login_session systemctl --user restart "$UNIT"
+        sleep 2
+        if as_login_session systemctl --user is-active --quiet "$UNIT"; then
+            step "$UNIT is running as $SERVICE_LOGIN"
+            say "  output = $(as_root sed -n 's/^[[:space:]]*output[[:space:]]*=[[:space:]]*//p' "$OUTPUT_CONFIG" | tail -n 1)"
+        else
+            step "$UNIT was started and is NOT running"
+            say ''
+            say "  $OUTPUT_CONFIG names an output, so this is that device failing to open rather"
+            say "  than the usual first-install case. What it said:"
+            say ''
+            journal="$(as_login_session journalctl --user -u "$UNIT" --no-pager -n 15 2>/dev/null || true)"
+            if [ -n "$journal" ]; then
+                printf '%s\n' "$journal" | sed 's/^/    /'
+            else
+                say "    (nothing readable in the journal; try: ${SESSION_P}journalctl --user -u $UNIT -n 50)"
+            fi
+            say ''
+            say "  '${SESSION_P}$BINARY -l' lists what this session really has."
+        fi
+    else
+        step "What $SERVICE_LOGIN can play through"
+        say ''
+        say '  (ALSA and PortAudio narrate their own enumeration on stderr -- a "jack server is'
+        say "  not running\" here is those libraries talking, not this player failing.)"
+        say ''
+        as_login_session "$BINARY" -l 2>&1 | sed 's/^/  /'
+    fi
+
+    step 'Next'
+    if [ "$CONFIG_HAS_OUTPUT" != 'yes' ]; then
+        say ''
+        say "  1. Pick a device from that list and put it in $OUTPUT_CONFIG. Keys are the long"
+        say '     flag names without their dashes:'
+        say ''
+        say "       ${SUDO_P}nano $OUTPUT_CONFIG"
+        say ''
+        say '  2. Start it:'
+        say ''
+        say "       systemctl --user start $UNIT"
+        say "       systemctl --user status $UNIT"
+        say ''
+        say '  3. Then:'
+    else
+        say ''
+    fi
+    say ''
+    say '     Watch it:'
+    say ''
+    say "       journalctl --user -u $UNIT -f"
+    say ''
+    say "     Ask it what it is doing, as '$SERVICE_LOGIN':"
+    say ''
+    say "       $BINARY status"
+    say ''
+    say '     Nothing else. The player advertises itself over mDNS and waits for a Sendspin'
+    say '     server to find it, so it should appear in your controller once it is playing'
+    say "     through a device. To dial a server instead, set 'server' in the config."
+    say ''
+    exit 0
 fi
 
 if [ "$HAVE_SYSTEMD" != 'yes' ]; then
